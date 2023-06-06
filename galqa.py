@@ -37,7 +37,7 @@ from sklearn.model_selection import train_test_split
 
 nltk.download('punkt')
 
-logging.basicConfig(filename='./galqa-siamese.log', level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', force=True)
+logging.basicConfig(filename='./galqa.log', level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', force=True)
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 logging.info("START Experiment")
 
@@ -48,19 +48,19 @@ logging.info("START Experiment")
 class HPARAMS:
 
         # query hyper params
-        text_match_boost = 1.0
-        text_phrase_match_boost = 1.0
-        chapter_match_boost = 1.0
-        chapter_phrase_match_boost = 1.0
-        use_question_to_statement = False
-        use_keyword_law_filter = False
+        text_match_boost = 1.0              # ES field `text` boosting value
+        text_phrase_match_boost = 1.0       # ES field `text` exact match boosting value
+        chapter_match_boost = 1.0           # ES field `chapter` boosting value
+        chapter_phrase_match_boost = 1.0    # ES field `chapter` exact match boosting value
+        use_question_to_statement = False   # Removes question words from the sentence
+        use_keyword_law_filter = False      # Filters the law options during retrieval to the identified entities contained within the question. TODO: Needs fixing
 
         # retriever param
-        top_k = 3
+        top_k = 3     # No. of documents to be reranked
 
         # reranker model
-        reranker_mode = 'BiEncoder' # 'BiEncoder', 'CrossEncoder'
-        reranker_model = 'indolem/indobert-base-uncased'
+        reranker_mode = 'BiEncoder'                       # Architecture mode of the reranker ('BiEncoder', 'CrossEncoder')
+        reranker_model = 'indolem/indobert-base-uncased'  # Pretrained model for the reranker
 
         # reranker training hyper params
         epochs=1 
@@ -68,19 +68,19 @@ class HPARAMS:
         learning_rate = 2e-5  
         test_size=0.25
         k_random_negative_examples = 3 
-        prepend_component_type = False 
-        resample_test_data=False 
-        rerank_relevance_only=False 
+        prepend_component_type = False      # Trains a special token [GRANULARITY]
+        resample_test_data=False            # Performs re-splitting of the initial data into a train-test split
+        rerank_relevance_only=False         # Rerank only on relevance aspect
         log_train_results = True 
 
         # BiEncoder-exclusive hyper param
-        max_siamese_train_size = -1
+        max_siamese_train_size = -1    # Maximumm training instances for the reranker (-1 for maximum value)
         
         # indexing hyper params
-        chapter_title_only_for_chapter=False 
-        include_map=False 
-        use_stop_removal_stemming=False 
-        article_only_index=False 
+        chapter_title_only_for_chapter=False    # Add chapter query expansion only to chapter components.
+        include_map=False                       # Includes the MAP (Mean-Average Precision) scores
+        use_stop_removal_stemming=False         # Use stopwords removal and stemming techniques
+        article_only_index=False                # BM25 indexes only articles
         use_stop_only=False 
         use_stem_only=False 
         
@@ -105,11 +105,13 @@ logging.info("Hyperparameters: " + json.dumps({k: v for k, v in HPARAMS.__dict__
 class CFG:
 
   BASE_DIR = "/workspace/thesis/"
-  # BASE_DIR = "/workspace/"
+  LAW_COMPONENT_DATASET = "datasets/law_component_dataset.csv"
+  GRANULARITY_QA_DATASET = "datasets/granularity_qa_dataset.csv"
+
   ELASTICSEARCH_HOST = 'http://localhost:9200'
   RANDOM_SEED = 123
 
-  # Mapping types for dataset
+  # Mapping types for dataset (avoiding different data types for each row)
   col_types = {
     'nomorPasal': str,
     'nomorAyat': 'Int64',
@@ -149,6 +151,7 @@ class CFG:
     'Letter (1st level)': 0
   }
 
+  # ES BM25 Query Template
   base_query = {
     "query": {
       "bool": {
@@ -210,6 +213,11 @@ seed_everything(seed_value = CFG.RANDOM_SEED)
 
 # Keyword-based filter
 def extract_definition_keyword(definition_text: str):
+
+  '''
+  Extracts the keyword <base_term> in which an entity is defined in the first chapter.
+  '''
+
   try:
     find = re.search('(?P<base_term>([A-Z][a-z\s\/]*)+) adalah', definition_text)
     find_2 = re.sub(' yang selanjutnya (disingkat|disebut) ', '/', find.group('base_term'))
@@ -226,6 +234,11 @@ def get_keywords_from_query(query: str):
 # ====================================================
 
 def question_to_statement(question: str):
+
+  '''
+  Removes question words from a sentence.
+  '''
+
   if not HPARAMS.use_question_to_statement:
     return question
   pattern = "(?P<qWord>kapan|(ber|meng|si)?apa|(di|ke) ?(mana)|bagaimana) ?(saja)? ?(kah)?"
@@ -236,63 +249,72 @@ def question_to_statement(question: str):
   result = result.strip()
   return result
 
-# given chapter, get an article, subsection, and letter (if possible)
+
 def chapter_find_in_line(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given chapter.
+  given chapter, get an article, subsection, and letter (if possible)
+  '''
+
   in_line_indexes = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   
-  # get single article
+  # get articles
   article_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "pasal"', engine='python')
   if (len(article_results) > 0):
-    # negative_text_passages.append(article_results.iloc[0]['isiTeks'])
     in_line_indexes += article_results.index.to_list()
 
-  # get single subsection
+  # get subsections
   subsection_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "ayat"', engine='python')
   if (len(subsection_results) > 0):
-    # negative_text_passages.append(subsection_results.iloc[0]['isiTeks'])
     in_line_indexes += subsection_results.index.to_list()
 
   # get single letter
   letter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and (type == "huruf-ayat" or type == "huruf-pasal")', engine='python')
   if (len(letter_results) > 0):
-    # negative_text_passages.append(letter_results.iloc[0]['isiTeks'])
     in_line_indexes += letter_results.index.to_list()
-  
-  # return negative_text_passages
+
   return in_line_indexes
 
-# given article, get the chapter, subsection and letter
 def article_find_in_line(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given article.
+  given article, get the chapter, subsection and letter
+  '''
+
   in_line_indexes = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
   nomor_pasal = str(law_component.article)
   nomor_peraturan = law_component.law_number
 
-  # get single chapter
+  # get a single chapter
   chapter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "bab"', engine='python')
   if (len(chapter_results) > 0):
-    # negative_text_passages.append(chapter_results.iloc[0]['isiTeks'])
     in_line_indexes += chapter_results.index.to_list()
 
-  # get single subsection
+  # get subsections
   subsection_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and type == "ayat"', engine='python')
   if (len(subsection_results) > 0):
-    # negative_text_passages.append(subsection_results.iloc[0]['isiTeks'])
     in_line_indexes += subsection_results.index.to_list()  
 
-  # get single letter
+  # get letters
   letter_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and (type == "huruf-ayat" or type == "huruf-pasal")', engine='python')
   if (len(letter_results) > 0):
-    # negative_text_passages.append(letter_results.iloc[0]['isiTeks'])
     in_line_indexes += letter_results.index.to_list()
-  
-  # return negative_text_passages
+
   return in_line_indexes
 
-# given subsection, get chapter, article, and letter (if possible)
+
 def subsection_find_in_line(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given subsection.
+  given subsection, get chapter, article, and letter (if possible)
+  '''
+
   in_line_indexes = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
@@ -300,29 +322,30 @@ def subsection_find_in_line(qa_data):
   nomor_ayat = law_component.subsection
   nomor_peraturan = law_component.law_number
 
-  # get single chapter
+  # get a single chapter
   chapter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "bab"', engine='python')
   if (len(chapter_results) > 0):
-    # negative_text_passages.append(chapter_results.iloc[0]['isiTeks'])
     in_line_indexes += chapter_results.index.to_list()
 
-  # get single article
+  # get a single article
   article_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and type == "pasal"', engine='python')
   if (len(article_results) > 0):
-    # negative_text_passages.append(article_results.iloc[0]['isiTeks'])
     in_line_indexes += article_results.index.to_list()
 
-  # get single letter
+  # get letters
   letter_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and nomorAyat == @nomor_ayat and (type == "huruf-ayat" or type == "huruf-pasal")', engine='python')
   if (len(letter_results) > 0):
-    # negative_text_passages.append(letter_results.iloc[0]['isiTeks'])
     in_line_indexes += letter_results.index.to_list()
-  
-  # return negative_text_passages
+
   return in_line_indexes
 
-# given letter, get chapter, article and subsection
 def letter_find_in_line(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given letter.
+  given letter, get chapter, article and subsection
+  '''
+
   in_line_indexes = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
@@ -331,28 +354,31 @@ def letter_find_in_line(qa_data):
   nomor_huruf = str(law_component.letter)
   nomor_peraturan = law_component.law_number
 
-  # get single chapter
+  # get a single chapter
   chapter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "bab"', engine='python')
   if (len(chapter_results) > 0):
-    # negative_text_passages.append(chapter_results.iloc[0]['isiTeks'])
     in_line_indexes += chapter_results.index.to_list()
 
-  # get single article
+  # get a single article
   article_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and type == "pasal"', engine='python')
   if (len(article_results) > 0):
-    # negative_text_passages.append(article_results.iloc[0]['isiTeks'])
     in_line_indexes += article_results.index.to_list()
 
-  # get single subsection
+  # get a single subsection
   subsection_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and nomorAyat == @nomor_ayat and type == "ayat"', engine='python')
   if (len(subsection_results) > 0):
-    # negative_text_passages.append(subsection_results.iloc[0]['isiTeks'])
     in_line_indexes += subsection_results.index.to_list()
-  
-  # return negative_text_passages
+
   return in_line_indexes
 
+
 def find_in_line_indexes(qa_data):
+
+  '''
+  Helper function for finding components in the same granularity path as the given row of QA data.
+  Uses if-else to switch case
+  '''
+
   if (qa_data['Answer Granularity'] == 'Chapter'):
     return chapter_find_in_line(qa_data)
   elif (qa_data['Answer Granularity'] == 'Article'):
@@ -363,7 +389,12 @@ def find_in_line_indexes(qa_data):
     return letter_find_in_line(qa_data)
   return []
 
-def get_test_result(row):
+def get_bm25_test_result(row):
+
+  '''
+  Performs evaluation testing for BM25
+  '''
+
   question = row['Question']
   query = copy.deepcopy(CFG.base_query)
   query['query']['bool']['should'][0]['match']['text']['query'] = question_to_statement(question)
@@ -371,7 +402,7 @@ def get_test_result(row):
   query['query']['bool']['should'][2]['match_phrase']['text']['query'] = question_to_statement(question)
   query['query']['bool']['should'][3]['match_phrase']['chapterTitle']['query'] = question_to_statement(question)
   
-  # keywords & law filter
+  # keywords & law filter (TODO: Needs fixing)
   keywords = get_keywords_from_query(question)
   if len(keywords) > 0 and HPARAMS.use_keyword_law_filter:
     law_uris = set().union(*[reverse_keywords_dict[k] for k in keywords])
@@ -386,8 +417,7 @@ def get_test_result(row):
   ap_result = 0
   if (HPARAMS.include_map):
     result = es.search(
-      index="index_redundant" + "_" + str(cur_timestamp), 
-    #       body=query
+      index="index_redundant" + "_" + str(cur_timestamp),
       query=query['query'],
       size=3000
     )
@@ -449,8 +479,7 @@ def get_test_result(row):
     
   else:
     result = es.search(
-      index="index_redundant" + "_" + str(cur_timestamp), 
-    #       body=query
+      index="index_redundant" + "_" + str(cur_timestamp),
       query=query['query']
     )
 
@@ -468,6 +497,11 @@ def get_test_result(row):
 # ====================================================
 
 def get_tokens(passage):
+
+  '''
+  Performs word tokenization
+  '''
+
   return nltk.word_tokenize(passage)
 
 def extract_results(results):
@@ -483,6 +517,11 @@ def extract_results(results):
     return results.iloc[0]['isiTeks']
 
 def get_text(row):
+
+  '''
+  A wrapper function to find the text passage for a certain law component. Row refers to the QA dataset's row(s).
+  '''
+
   law_component = LawComponent.from_answer_granularity_row(row)
   try:
     results = df.query('law_component == @law_component')
@@ -491,6 +530,11 @@ def get_text(row):
     return None
 
 def evaluate_retriever(row):
+
+  '''
+  Evaluates the retriever performance
+  '''
+
   lc_expected = LawComponent.from_answer_granularity_row(row.to_dict())
   all_correct = False
   article_correct = False
@@ -517,6 +561,11 @@ def evaluate_retriever(row):
           "f1_score":f1_score}
 
 def train_test_split_from_retriever(df):
+
+  '''
+  A wrapper function for performing train-test splitting.
+  '''
+
   df_train = df.drop(CFG.test_indexes).copy(deep=True)
   df_test = df.loc[CFG.test_indexes].copy(deep=True)
 
@@ -535,6 +584,10 @@ def train_test_split_from_retriever(df):
 # ====================================================
 
 def compute_qa_f1(actual, pred):
+
+  '''
+  Performs token-wise F1 calculation between actual and predicted answer.
+  '''
 
   if type(actual) != str or type(pred) != str:
     return 0
@@ -561,8 +614,14 @@ def compute_qa_f1(actual, pred):
 # Reranker Utility Functions
 # ====================================================
 
-# given chapter, get an article, subsection, and letter (if possible)
 def chapter_find_negative_examples(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given chapter.
+  These components would serve as the negative examples in training the reranker using Triplet Loss.
+  given chapter, get an article, subsection, and letter (if possible)
+  '''
+
   negative_text_passages = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
@@ -571,26 +630,29 @@ def chapter_find_negative_examples(qa_data):
   # get single article
   article_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "pasal"', engine='python')
   if (len(article_results) > 0):
-    # negative_text_passages.append(article_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(article_results))
 
   # get single subsection
   subsection_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "ayat"', engine='python')
   if (len(subsection_results) > 0):
-    # negative_text_passages.append(subsection_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(subsection_results))
 
   # get single letter
   letter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and (type == "huruf-ayat" or type == "huruf-pasal")', engine='python')
   if (len(letter_results) > 0):
-    # negative_text_passages.append(letter_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(letter_results))
   
   # return negative_text_passages
   return law_component, negative_text_passages
 
-# given article, get the chapter, subsection and letter
 def article_find_negative_examples(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given article.
+  These components would serve as the negative examples in training the reranker using Triplet Loss.
+  given article, get a chapter, subsection, and letter (if possible)
+  '''
+
   negative_text_passages = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
@@ -600,26 +662,29 @@ def article_find_negative_examples(qa_data):
   # get single chapter
   chapter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "bab"', engine='python')
   if (len(chapter_results) > 0):
-    # negative_text_passages.append(chapter_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(chapter_results))
 
   # get single subsection
   subsection_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and type == "ayat"', engine='python')
   if (len(subsection_results) > 0):
-    # negative_text_passages.append(subsection_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(subsection_results))    
 
   # get single letter
   letter_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and (type == "huruf-ayat" or type == "huruf-pasal")', engine='python')
   if (len(letter_results) > 0):
-    # negative_text_passages.append(letter_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(letter_results))
   
   # return negative_text_passages
   return law_component, negative_text_passages
 
-# given subsection, get chapter, article, and letter (if possible)
 def subsection_find_negative_examples(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given subsection.
+  These components would serve as the negative examples in training the reranker using Triplet Loss.
+  given subsection, get a chapter, article, and a letter
+  '''
+
   negative_text_passages = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
@@ -630,26 +695,29 @@ def subsection_find_negative_examples(qa_data):
   # get single chapter
   chapter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "bab"', engine='python')
   if (len(chapter_results) > 0):
-    # negative_text_passages.append(chapter_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(chapter_results))
 
   # get single article
   article_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and type == "pasal"', engine='python')
   if (len(article_results) > 0):
-    # negative_text_passages.append(article_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(article_results))
 
   # get single letter
   letter_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and nomorAyat == @nomor_ayat and (type == "huruf-ayat" or type == "huruf-pasal")', engine='python')
   if (len(letter_results) > 0):
-    # negative_text_passages.append(letter_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(letter_results))
   
   # return negative_text_passages
   return law_component, negative_text_passages
 
-# given letter, get chapter, article and subsection
 def letter_find_negative_examples(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given letter.
+  These components would serve as the negative examples in training the reranker using Triplet Loss.
+  given letter, get an article, subsection, and chapter
+  '''
+
   negative_text_passages = []
   law_component = LawComponent.from_answer_granularity_row(qa_data)
   nomor_bab = law_component.chapter
@@ -661,25 +729,28 @@ def letter_find_negative_examples(qa_data):
   # get single chapter
   chapter_results = df.query('nomorBab == @nomor_bab and nomorPeraturan == @nomor_peraturan and type == "bab"', engine='python')
   if (len(chapter_results) > 0):
-    # negative_text_passages.append(chapter_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(chapter_results))
 
   # get single article
   article_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and type == "pasal"', engine='python')
   if (len(article_results) > 0):
-    # negative_text_passages.append(article_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(article_results))
 
   # get single subsection
   subsection_results = df.query('nomorPeraturan == @nomor_peraturan and nomorPasal == @nomor_pasal and nomorAyat == @nomor_ayat and type == "ayat"', engine='python')
   if (len(subsection_results) > 0):
-    # negative_text_passages.append(subsection_results.iloc[0]['isiTeks'])
     negative_text_passages.append(extract_results(subsection_results))
   
   # return negative_text_passages
   return law_component, negative_text_passages
 
 def find_negative_examples(qa_data):
+
+  '''
+  Helper for finding components in the same granularity path as the given component.
+  These components would serve as the negative examples in training the reranker using Triplet Loss.
+  '''
+
   if (qa_data['Answer Granularity'] == 'Chapter'):
     return chapter_find_negative_examples(qa_data)
   elif (qa_data['Answer Granularity'] == 'Article'):
@@ -691,6 +762,11 @@ def find_negative_examples(qa_data):
   return None, []
 
 def sample_random_negative_examples(lc: LawComponent, k: int):
+
+  '''
+  Take k samples at random as the negative samples for training.
+  '''
+
   if k==0:
     return []  # early `return` to avoid random state from being changed
 
@@ -704,6 +780,11 @@ def sample_random_negative_examples(lc: LawComponent, k: int):
   return negative_text_passages
 
 def log_model_results(df_train, df_test):
+
+  '''
+  Produce the logs for the reranker's evaluation result
+  '''
+
   if (HPARAMS.log_train_results):
     logging.info("[TRAIN] Reranked QA F1 Score Average {:.2f}".format(df_train['f1_score'].mean() * 100))
     logging.info("[TRAIN] Reranked Exact Match {:.2f}".format(len(df_train.query('top_1_rerank_match == True')) / len(df_train) * 100))
@@ -759,6 +840,11 @@ def log_model_results(df_train, df_test):
 # ====================================================
 
 def biencoder_training(df_train):
+
+  '''
+  Performs bi-encoder reranker training.
+  '''
+
   model = SentenceTransformer(HPARAMS.reranker_model)
 
   if (HPARAMS.prepend_component_type):
@@ -819,6 +905,11 @@ def biencoder_training(df_train):
   return model, df_train
 
 def crossencoder_training(df_train):
+
+  '''
+  Performs cross-encoder reranker training.
+  '''
+
   ce_model = CrossEncoder(HPARAMS.reranker_model)
   ce_model.max_length = 512
 
@@ -881,6 +972,11 @@ def crossencoder_training(df_train):
 # ====================================================
 
 def biencoder_inference(model, df):
+
+  '''
+  Performs bi-encoder reranker inference (end-to-end: BM25 to Reranking).
+  '''
+
   top_k_test_results = []
 
   k = HPARAMS.top_k
@@ -909,13 +1005,10 @@ def biencoder_inference(model, df):
     )
 
     try:
-      # top_1_test_results.append(result['hits']['hits'][0])
       top_k_test_results.append(result['hits']['hits'][:k])
     except IndexError:
-      # top_1_test_results.append({})
       top_k_test_results.append({})
 
-  # test_data_redundant['top_1'] = top_1_test_results
   df['top_k'] = top_k_test_results
 
   top_1_rerank_result = []
@@ -966,6 +1059,11 @@ def biencoder_inference(model, df):
   return df
 
 def crossencoder_inference(model, df):
+
+  '''
+  Performs cross-encoder reranker inference (end-to-end: BM25 to Reranking).
+  '''
+
   top_k_test_results = []
 
   k = HPARAMS.top_k
@@ -993,13 +1091,10 @@ def crossencoder_inference(model, df):
     )
 
     try:
-      # top_1_test_results.append(result['hits']['hits'][0])
       top_k_test_results.append(result['hits']['hits'][:k])
     except IndexError:
-      # top_1_test_results.append({})
       top_k_test_results.append({})
 
-  # test_data_redundant['top_1'] = top_1_test_results
   df['top_k'] = top_k_test_results
 
   top_1_rerank_result = []
@@ -1054,7 +1149,7 @@ def crossencoder_inference(model, df):
 # Dataset Preprocessing for Elastic Search
 # ====================================================
 
-df = pd.read_csv(CFG.BASE_DIR + '2023-04-20_pp-dataset.csv', dtype=CFG.col_types)
+df = pd.read_csv(CFG.BASE_DIR + CFG.LAW_COMPONENT_DATASET, dtype=CFG.col_types)
 df = df.drop_duplicates(subset=['uri']).reset_index()
 df['uri'] = df['uri'].apply(lambda x: x.replace('http://', 'https://'))
 for col in CFG.fill_values_dataset:
@@ -1087,7 +1182,7 @@ for law_uri, keywords in keywords_dict.items():
 # Dataset Preprocessing for QA
 # ====================================================
 
-test_data = pd.read_csv(CFG.BASE_DIR + 'Granularity-Based Law QA Dataset - 2023-04-20.csv', dtype=CFG.test_data_types)
+test_data = pd.read_csv(CFG.BASE_DIR + CFG.GRANULARITY_QA_DATASET, dtype=CFG.test_data_types)
 
 test_data['Answer Granularity'] = test_data['Answer Granularity'].replace(CFG.answer_granularity_dict)
 for col in CFG.fill_values_qa_dataset:
@@ -1245,7 +1340,7 @@ top_k_test_results = []
 ap_results = []
 
 for _,row in test_data_redundant.iterrows():
-  top_1_test_result, top_k_test_result, ap_result = get_test_result(row)
+  top_1_test_result, top_k_test_result, ap_result = get_bm25_test_result(row)
   top_1_test_results.append(top_1_test_result)
   top_k_test_results.append(top_k_test_result)
   if HPARAMS.include_map:
